@@ -1,237 +1,352 @@
-import React, { useEffect, useState } from 'react';
-import { Head, usePage } from '@inertiajs/react';
-import FileTable from './FileTable';
-import PrintConfig from './PrintConfig';
-import EmptyQR from './EmptyQR';
-import DeleteModal from './Modals/DeleteModal';
-
-export default function PrintStationPage() {
-  const { props } = usePage();
-  const { filetoprints = [], qrCode = null } = props as any;
-
-  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
-  const [fileToDelete, setFileToDelete] = useState<number | null>(null);
-
-  function openDeleteModal(id: number) {
-    setFileToDelete(id);
-    setDeleteModalOpen(true);
-  }
-
-  return (
-    <div className="min-h-screen flex flex-col bg-[#FAFAFA] font-roboto text-gray-800 p-4 md:p-8">
-      <Head title="Print Station" />
-
-      <div className="flex gap-6">
-        <div className="w-2/3">
-          <FileTable files={filetoprints} onDelete={openDeleteModal} />
-        </div>
-        <div className="w-1/3 space-y-4">
-          <PrintConfig initialConfig={{}} />
-          <EmptyQR qrData={qrCode} />
-        </div>
-      </div>
-
-      <DeleteModal open={deleteModalOpen} id={fileToDelete} onClose={() => setDeleteModalOpen(false)} />
-    </div>
-  );
-}
-<script setup>
-import { ref, onMounted, watch } from 'vue';
-import { Head, useForm, router } from '@inertiajs/vue3';
-import axios from 'axios';
-import { PDFDocument } from 'pdf-lib';
+import React, { useEffect, useState, useCallback } from "react";
+import { Head, usePage, router } from "@inertiajs/react";
+import axios from "axios";
+import { PDFDocument } from "pdf-lib";
 
 // COMPONENTS
-import EmptyQR from './EmptyQR.vue';
-import FileTable from './FileTable.vue';
-import PrintConfig from './PrintConfig.tsx/index.js';
-import DeleteModal from './Modals/DeleteModal.tsx/index.js';
+import EmptyQR from "./EmptyQR";
+import FileTable from "./FileTable";
+import PrintConfig from "./PrintConfig";
+import DeleteModal from "./Modals/DeleteModal";
 
-// PROPS
-const props = defineProps({
-    filetoprints: Array,
-    qrCode: String,
-    stationId: Number,
-});
+// INTERFACES
+interface PrintRequest {
+    id: number;
+    copies?: number;
+    color_mode?: "color" | "mono";
+    paper_size?: string;
+    page_range?: string;
+    detected_pages?: number;
+}
 
-// STATE
-const modalOpen = ref(false);
-const deleteModalOpen = ref(false);
-const bulkDeleteModalOpen = ref(false);
-const loading = ref(false);
+export interface FileToPrint {
+    id: number;
+    type: string;
+    original_name: string; // Tambahkan ini
+    created_at: string; // Tambahkan ini
+    url: string;
+    status?: string;
+    latest_print_request?: {
+        id: number;
+        request_id: string | number; // Tambahkan ini agar cocok dengan data internal tabel
+        copies?: number;
+        color_mode?: "color" | "mono";
+        paper_size?: string;
+        page_range?: string;
+        detected_pages?: number;
+    } | null;
+}
 
-const currentFile = ref(null);
-const fileToDelete = ref(null);
-const selectedIds = ref([]);
-const showQr = ref(props.filetoprints.length === 0);
+export interface ConfigState {
+    pages: number;
+    paperSize: "A4" | "Legal" | string;
+    pageOption: "all" | "custom" | string;
+    customPages: string;
+    copies: number;
+    colorMode: "color" | "mono" | "bw"; // Sesuaikan dengan opsi yang kamu pakai
+}
 
-const config = ref({
-    copies: 1,
-    colorMode: 'color',
-    paperSize: 'A4',
-    pageOption: 'all',
-    customPages: '',
-    pages: 1,
-});
-
-// WATCHERS
-watch(() => props.filetoprints.length, (newLength) => {
-    if (newLength === 0) showQr.value = true;
-    else showQr.value = false;
-});
-
-// METHODS
-const openPrintModal = async (file) => {
-    currentFile.value = file;
-    if (file.latest_print_request) {
-        const v = file.latest_print_request;
-        config.value = {
-            copies: v.copies || 1,
-            colorMode: v.color_mode || 'color',
-            paperSize: v.paper_size || 'A4',
-            pageOption: v.page_range === 'all' ? 'all' : 'custom',
-            customPages: v.page_range === 'all' ? '' : v.page_range,
-            pages: v.detected_pages || 1,
+interface PageProps {
+    filetoprints: FileToPrint[];
+    qrCode: string | null;
+    stationId: number;
+    auth: {
+        user: {
+            name: string;
         };
-    } else {
-        config.value = { copies: 1, colorMode: 'color', paperSize: 'A4', pageOption: 'all', customPages: '', pages: 1 };
-    }
+    };
+}
 
-    modalOpen.value = true;
+export default function PrintStationPage() {
+    // Ambil props global dari Inertia Page Context
+    const {
+        filetoprints = [],
+        qrCode = null,
+        stationId,
+        auth,
+    } = usePage<any>().props as PageProps;
 
-    if (file.type === 'PDF' && !file.latest_print_request) {
-        try {
+    console.log({ filetoprints, qrCode, stationId, auth });
 
-            const proxyUrl = route('upa.station.proxy-pdf', file.id);
-            const response = await fetch(proxyUrl);
+    // STATE MODAL
+    const [modalOpen, setModalOpen] = useState<boolean>(false);
+    const [deleteModalOpen, setDeleteModalOpen] = useState<boolean>(false);
+    const [bulkDeleteModalOpen, setBulkDeleteModalOpen] =
+        useState<boolean>(false);
+    const [loading, setLoading] = useState<boolean>(false);
 
-            if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+    // STATE DATA
+    const [currentFile, setCurrentFile] = useState<FileToPrint | null>(null);
+    const [fileToDelete, setFileToDelete] = useState<FileToPrint | null>(null);
+    const [selectedIds, setSelectedIds] = useState<number[]>([]);
+    const [showQr, setShowQr] = useState<boolean>(filetoprints.length === 0);
 
-            const arrayBuffer = await response.arrayBuffer();
-            // Verifikasi jika arrayBuffer kosong
-            if (arrayBuffer.byteLength === 0) throw new Error("File PDF kosong atau corrupt.");
-
-            const pdfDoc = await PDFDocument.load(arrayBuffer, {
-                ignoreEncryption: true // Tambahkan ini untuk PDF yang terproteksi ringan
-            });
-
-            config.value.pages = pdfDoc.getPageCount();
-            console.log("Success detect pages:", config.value.pages);
-        } catch (e) {
-            console.error("Gagal menghitung halaman:", e);
-            config.value.pages = 1; // Fallback jika gagal
-        }
-    } else if (file.type !== 'PDF' && !file.latest_print_request) {
-        config.value.pages = 1;
-    }
-};
-
-const closePrintModal = () => {
-    modalOpen.value = false;
-    currentFile.value = null;
-};
-
-const submitRequest = () => {
-    const form = useForm({
-        file_id: currentFile.value.id,
-        station_id: props.stationId,
-        print_config: {
-            copies: config.value.copies,
-            color: config.value.colorMode,
-            paper: config.value.paperSize,
-            pages: config.value.pageOption === 'custom' ? config.value.customPages : 'all',
-            detected_pages: config.value.pages
-        }
+    const [config, setConfig] = useState<ConfigState>({
+        copies: 1,
+        colorMode: "color",
+        paperSize: "A4",
+        pageOption: "all",
+        customPages: "",
+        pages: 1,
     });
 
-    form.post(route('upa.station.request-print'), {
-        onSuccess: () => { modalOpen.value = false; },
-        onFinish: () => router.reload(),
-    });
-};
-
-const executePrint = async () => {
-    if (!currentFile.value || !currentFile.value.latest_print_request) return;
-    loading.value = true;
-
-    try {
-        const response = await axios.post(route('upa.station.print'), {
-            request_id: currentFile.value.latest_print_request.id,
-        });
-
-        if (response.data.status === 'success') {
-            alert(response.data.message);
-            closePrintModal();
-            router.reload();
+    // WATCHER REPLACEMENT: Sinkronisasi QR State ketika data file berubah
+    useEffect(() => {
+        if (filetoprints.length === 0) {
+            setShowQr(true);
         } else {
-            alert(response.data.message);
+            setShowQr(false);
         }
-    } catch (error) {
-        alert(error.response?.data?.message || 'Gagal mengirim perintah cetak.');
-    } finally {
-        loading.value = false;
-    }
-};
+    }, [filetoprints.length]);
 
+    // REALTIME WEBSOCKET: Laravel Echo
+    useEffect(() => {
+        const echo = (window as any).Echo;
+        if (echo) {
+            // Fungsi helper untuk reload yang aman dari error TypeScript
+            const reloadPage = () => {
+                router.visit(window.location.href, {
+                    method: "get",
+                    replace: true,
+                    preserveScroll: true, // Di sini 'preserveScroll' 100% valid secara type definition
+                    preserveState: true,
+                });
+            };
 
+            const channel = echo
+                .channel(`printing-channel.${stationId}`)
+                .listen(".file.uploaded", reloadPage)
+                .listen(".transaction.updated", reloadPage);
 
-const openDeleteModal = (file) => {
-    fileToDelete.value = file;
-    deleteModalOpen.value = true;
-};
+            return () => {
+                channel.stopListening(".file.uploaded");
+                channel.stopListening(".transaction.updated");
+            };
+        }
+    }, [stationId]);
 
-const confirmDelete = () => {
-    if (fileToDelete.value) {
-        router.delete(route('upa.station.destroy', fileToDelete.value.id), {
-            onSuccess: () => {
-                deleteModalOpen.value = false;
-                fileToDelete.value = null;
+    // METHODS: Handler Aksi Modal Cetak
+    const openPrintModal = useCallback(async (file: FileToPrint) => {
+        setCurrentFile(file);
+
+        // Set baseline konfigurasi awal
+        let targetConfig: ConfigState = {
+            copies: 1,
+            colorMode: "color",
+            paperSize: "A4",
+            pageOption: "all",
+            customPages: "",
+            pages: 1,
+        };
+
+        if (file.latest_print_request) {
+            const v = file.latest_print_request;
+            targetConfig = {
+                copies: v.copies || 1,
+                colorMode: v.color_mode || "color",
+                paperSize: v.paper_size || "A4",
+                pageOption: v.page_range === "all" ? "all" : "custom",
+                customPages: v.page_range === "all" ? "" : v.page_range || "",
+                pages: v.detected_pages || 1,
+            };
+            setConfig(targetConfig);
+        } else {
+            setConfig(targetConfig);
+        }
+
+        setModalOpen(true);
+
+        // Otomatis Deteksi Jumlah Halaman File PDF jika belum pernah di-request
+        if (file.type === "PDF" && !file.latest_print_request) {
+            try {
+                // Panggil helper route ziggy global laravel
+                const proxyUrl = (window as any).route(
+                    "upa.station.proxy-pdf",
+                    file.id,
+                );
+                const response = await fetch(proxyUrl);
+
+                if (!response.ok)
+                    throw new Error(`HTTP error! status: ${response.status}`);
+
+                const arrayBuffer = await response.arrayBuffer();
+                if (arrayBuffer.byteLength === 0)
+                    throw new Error("File PDF kosong atau corrupt.");
+
+                const pdfDoc = await PDFDocument.load(arrayBuffer, {
+                    ignoreEncryption: true,
+                });
+
+                setConfig((prev) => ({
+                    ...prev,
+                    pages: pdfDoc.getPageCount(),
+                }));
+                console.log("Success detect pages:", pdfDoc.getPageCount());
+            } catch (e) {
+                console.error("Gagal menghitung halaman:", e);
+                setConfig((prev) => ({ ...prev, pages: 1 })); // Fallback
             }
+        } else if (file.type !== "PDF" && !file.latest_print_request) {
+            setConfig((prev) => ({ ...prev, pages: 1 }));
+        }
+    }, []);
+
+    const closePrintModal = useCallback(() => {
+        setModalOpen(false);
+        setCurrentFile(null);
+    }, []);
+
+    // METHODS: Kirim Konfigurasi Cetak ke Laravel
+    const submitRequest = useCallback(() => {
+        if (!currentFile) return;
+
+        const payload = {
+            file_id: currentFile.id,
+            station_id: stationId,
+            print_config: {
+                copies: config.copies,
+                color: config.colorMode,
+                paper: config.paperSize,
+                pages:
+                    config.pageOption === "custom" ? config.customPages : "all",
+                detected_pages: config.pages,
+            },
+        };
+
+        router.post(
+            (window as any).route("upa.station.request-print"),
+            payload,
+            {
+                onSuccess: () => {
+                    setModalOpen(false);
+                },
+                onFinish: () => router.reload(),
+            },
+        );
+    }, [currentFile, config, stationId]);
+
+    // METHODS: Eksekusi Kirim ke Mesin Printer Fisik
+    const executePrint = useCallback(async () => {
+        if (!currentFile?.latest_print_request) return;
+        setLoading(true);
+
+        try {
+            const response = await axios.post(
+                (window as any).route("upa.station.print"),
+                {
+                    request_id: currentFile.latest_print_request.id,
+                },
+            );
+
+            if (response.data.status === "success") {
+                alert(response.data.message);
+                closePrintModal();
+                router.reload();
+            } else {
+                alert(response.data.message);
+            }
+        } catch (error: any) {
+            alert(
+                error.response?.data?.message ||
+                    "Gagal mengirim perintah cetak.",
+            );
+        } finally {
+            setLoading(false);
+        }
+    }, [currentFile, closePrintModal]);
+
+    // METHODS: Handler Aksi Hapus File Tunggal
+    const openDeleteModal = useCallback((file: FileToPrint) => {
+        setFileToDelete(file);
+        setDeleteModalOpen(true);
+    }, []);
+
+    const confirmDelete = useCallback(() => {
+        if (fileToDelete) {
+            router.delete(
+                (window as any).route("upa.station.destroy", fileToDelete.id),
+                {
+                    onSuccess: () => {
+                        setDeleteModalOpen(false);
+                        setFileToDelete(null);
+                    },
+                },
+            );
+        }
+    }, [fileToDelete]);
+
+    // METHODS: Handler Aksi Hapus Massal (Bulk Delete)
+    const confirmBulkDelete = useCallback(() => {
+        router.delete((window as any).route("upa.station.destroy-multiple"), {
+            data: { file_ids: selectedIds },
+            onSuccess: () => {
+                setSelectedIds([]);
+                setBulkDeleteModalOpen(false);
+            },
+            onError: () => {
+                setBulkDeleteModalOpen(false);
+            },
         });
-    }
-};
+    }, [selectedIds]);
 
-const confirmBulkDelete = () => {
-    router.delete(route('upa.station.destroy-multiple'), {
-        data: { file_ids: selectedIds.value },
-        onSuccess: () => {
-            selectedIds.value = [];
-            bulkDeleteModalOpen.value = false;
-        },
-        onError: () => { bulkDeleteModalOpen.value = false; }
-    });
-};
+    return (
+        <div className="font-roboto flex min-h-screen flex-col bg-[#FAFAFA] p-4 text-gray-800 md:p-8">
+            <Head title="Print Station" />
 
-onMounted(() => {
-    if (window.Echo) {
-        window.Echo.channel(`printing-channel.${props.stationId}`)
-            .listen('.file.uploaded', () => router.reload({ preserveScroll: true }))
-            .listen('.transaction.updated', () => router.reload({ preserveScroll: true }));
-    }
-});
-</script>
+            {/* EMPTY / QR STATE */}
+            {(filetoprints.length === 0 || showQr) && (
+                <EmptyQR
+                    qrCode={qrCode}
+                    showQr={showQr}
+                    stationName={auth.user.name}
+                    onToggleQr={() => setShowQr((prev) => !prev)}
+                />
+            )}
 
-<template>
-    <div class="min-h-screen flex flex-col bg-[#FAFAFA] font-roboto text-gray-800 p-4 md:p-8">
+            {/* FILE TABLE STATE */}
+            {filetoprints.length > 0 && (
+                <FileTable
+                    filetoprints={filetoprints}
+                    qrCode={qrCode}
+                    selectedIds={selectedIds}
+                    stationName={auth.user.name}
+                    onUpdateSelectedIds={setSelectedIds}
+                    onOpenPrintModal={openPrintModal}
+                    onOpenDeleteModal={openDeleteModal}
+                    onDeleteMultiple={() => setBulkDeleteModalOpen(true)}
+                />
+            )}
 
-        <!-- EMPTY / QR STATE -->
-        <EmptyQR v-if="filetoprints.length === 0 || showQr" :qr-code="qrCode" :show-qr="showQr"
-            :station-name="$page.props.auth.user.name" @toggle-qr="showQr = !showQr" />
+            {/* CONFIGURATION AND PREVIEW MODAL */}
+            <PrintConfig
+                show={modalOpen}
+                currentFile={currentFile}
+                config={config}
+                loading={loading}
+                onConfigChange={setConfig} // Memberikan akses merubah konfigurasi di child component
+                onClose={closePrintModal}
+                onSubmit={submitRequest}
+                onExecute={executePrint}
+            />
 
-        <!-- FILE TABLE STATE -->
-        <FileTable v-if="filetoprints.length > 0" :filetoprints="filetoprints" :qr-code="qrCode"
-             :selected-ids="selectedIds" :station-name="$page.props.auth.user.name"
-            @update-selected-ids="(ids) => selectedIds = ids" @open-print-modal="openPrintModal"
-            @open-delete-modal="openDeleteModal" @delete-multiple="bulkDeleteModalOpen = true" />
+            {/* SINGLE DELETE MODAL */}
+            <DeleteModal
+                show={deleteModalOpen}
+                id={currentFile?.id || null} // ✨ PASTIKAN UNTUK MENGIRIM ID DI SINI
+                onClose={() => setDeleteModalOpen(false)}
+                onConfirm={confirmDelete}
+            />
 
-        <!-- MODALS -->
-        <PrintConfig :show="modalOpen" :current-file="currentFile" :config="config" :loading="loading"
-            @close="closePrintModal" @submit="submitRequest" @execute="executePrint" />
-
-        <DeleteModal :show="deleteModalOpen" @close="deleteModalOpen = false" @confirm="confirmDelete" />
-
-        <DeleteModal :show="bulkDeleteModalOpen" :is-bulk="true" :title="`Hapus ${selectedIds.length} File?`"
-            message="Semua file yang dipilih akan dihapus permanen dari server." confirm-text="Hapus Semua"
-            @close="bulkDeleteModalOpen = false" @confirm="confirmBulkDelete" />
-    </div>
-</template>
+            {/* BULK DELETE MODAL */}
+            <DeleteModal
+                show={bulkDeleteModalOpen}
+                isBulk={true}
+                title={`Hapus ${selectedIds.length} File?`}
+                message="Semua file yang dipilih akan dihapus permanen dari server."
+                confirmText="Hapus Semua"
+                onClose={() => setBulkDeleteModalOpen(false)}
+                onConfirm={confirmBulkDelete}
+            />
+        </div>
+    );
+}
